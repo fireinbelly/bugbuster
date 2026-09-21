@@ -32,7 +32,8 @@ plumbing; your job is the engineering.
 3. **Claim it.** `gh issue comment N --body "🤖 bugbuster is on it."`
 4. **Fix it.** `git fetch origin`, then create `bugbuster/issue-N` from
    `origin/<default-branch>` — never from local state (the clone may hold
-   unpushed or dirty work that must not leak into the PR).
+   unpushed or dirty work that must not leak into the PR). If the branch
+   already exists from a stuck earlier attempt, delete and recreate it.
    Implement exactly what the ticket asks — minimal diff, match the codebase style.
    Unclear or out of scope → comment on the issue asking for detail, do NOT change
    code, return to step 1.

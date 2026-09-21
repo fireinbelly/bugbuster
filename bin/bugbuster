@@ -13,11 +13,13 @@ the GitHub repo to watch):
   bugbuster stop   [path]   stop the listener and delete the forwarding webhook
   bugbuster status          list listeners and queue depths
 """
+import fcntl
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 HOME = os.path.expanduser("~/.bugbuster")
@@ -67,18 +69,24 @@ def listener_pid(pidfile):
 
 def start_listener(slug):
     _, pidfile, logfile = paths_for(slug)
-    if listener_pid(pidfile):
-        return False
-    with open(logfile, "ab") as logf:
-        p = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "_serve", slug],
-            stdout=logf, stderr=logf, start_new_session=True)
-    with open(pidfile, "w") as f:
-        f.write(str(p.pid))
-    time.sleep(3)  # let gh webhook forward create/activate the hook
-    if p.poll() is not None:
-        os.remove(pidfile)
-        die(f"listener failed to start — see {logfile}")
+    # flock so two concurrent wait/listen calls can't both spawn a listener
+    with open(pidfile + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if listener_pid(pidfile):
+            return False
+        with open(logfile, "ab") as logf:
+            p = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "_serve", slug],
+                stdout=logf, stderr=logf, start_new_session=True)
+        with open(pidfile, "w") as f:
+            f.write(str(p.pid))
+        # reap on exit so a dead _serve never lingers as a zombie that
+        # os.kill(pid, 0) would misreport as alive (silent-hang bug)
+        threading.Thread(target=p.wait, daemon=True).start()
+        time.sleep(3)  # let gh webhook forward create/activate the hook
+        if p.poll() is not None:
+            os.remove(pidfile)
+            die(f"listener failed to start — see {logfile}")
     return True
 
 
@@ -121,10 +129,18 @@ def cmd_stop(path):
     r = subprocess.run(["gh", "api", f"repos/{slug}/hooks",
                         "--jq", '.[] | select(.name=="cli") | .id'],
                        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"bugbuster: could not list webhooks on {slug}: {r.stderr.strip()}",
+              file=sys.stderr)
     for hook_id in r.stdout.split():
-        subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{slug}/hooks/{hook_id}"],
-                       capture_output=True)
-        print(f"bugbuster: removed forwarding webhook {hook_id}", file=sys.stderr)
+        d = subprocess.run(["gh", "api", "-X", "DELETE",
+                            f"repos/{slug}/hooks/{hook_id}"],
+                           capture_output=True, text=True)
+        if d.returncode == 0:
+            print(f"bugbuster: removed forwarding webhook {hook_id}", file=sys.stderr)
+        else:
+            print(f"bugbuster: failed to remove webhook {hook_id}: {d.stderr.strip()}",
+                  file=sys.stderr)
 
 
 def cmd_status():
@@ -145,6 +161,7 @@ def cmd_status():
 def cmd_serve(slug):
     queue, _, _ = paths_for(slug)
     fails = 0
+    ok_once = False  # has gh ever run long enough to be considered healthy?
     while True:
         started = time.time()
         p = subprocess.Popen(
@@ -177,19 +194,28 @@ def cmd_serve(slug):
                 "created_at": issue.get("created_at", ""),
             }
             fname = os.path.join(queue,
-                                 f"{int(time.time() * 1000):013d}-{issue['number']}.json")
+                                 f"{int(time.time() * 1000):013d}-{issue['number']:010d}.json")
             with open(fname + ".tmp", "w") as f:
                 json.dump(ticket, f, indent=1)
             os.rename(fname + ".tmp", fname)  # atomic: wait never sees half a ticket
             log(f"queued issue #{issue['number']}: {issue['title']}")
         rc = p.wait()
-        # gh exited (network blip, laptop sleep). Restart unless it fails instantly.
-        fails = fails + 1 if time.time() - started < 30 else 0
-        if fails >= 3:
+        # gh exited (network blip, laptop sleep). Restart with backoff — but a
+        # failure before gh EVER ran healthily is a setup error (bad perms,
+        # bad flags): die loudly so start_listener's 3s check surfaces it.
+        if time.time() - started >= 30:
+            ok_once, fails = True, 0
+        else:
+            fails += 1
+        if not ok_once:
+            log(f"gh webhook forward failed at startup (rc={rc}); giving up")
+            sys.exit(1)
+        if fails >= 10:  # ~8+ min of consecutive instant failures
             log(f"gh webhook forward keeps failing (rc={rc}); giving up")
             sys.exit(1)
-        log(f"gh webhook forward exited rc={rc}; restarting in 5s")
-        time.sleep(5)
+        delay = min(5 * (2 ** fails), 60) if fails else 5
+        log(f"gh webhook forward exited rc={rc}; restarting in {delay}s")
+        time.sleep(delay)
 
 
 def main():
