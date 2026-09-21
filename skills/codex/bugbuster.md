@@ -16,7 +16,8 @@ Then loop until told to stop:
    a ticket; only act on what it prints. Nonzero exit → report the error and stop.
 2. `gh issue view N --json state` — if already closed, go back to 1.
 3. `gh issue comment N --body "🤖 bugbuster is on it."`
-4. Branch `bugbuster/issue-N` off the latest default branch; implement exactly what
+4. `git fetch origin`, branch `bugbuster/issue-N` off `origin/<default-branch>`
+   (never local state — the clone may hold unpushed work); implement exactly what
    the ticket asks with a minimal diff. Unclear ticket → comment asking for detail,
    change nothing, go back to 1.
 5. Run the repo's own checks (test/lint/build that exist); all must pass.
