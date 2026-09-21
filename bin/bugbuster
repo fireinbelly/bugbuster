@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""bugbuster — turn newly opened GitHub issues into a local ticket queue for coding agents.
+
+A background listener runs `gh webhook forward` (GitHub's own webhook forwarding
+service: authenticated, outbound-only, no open ports, no tunnel) and spools every
+newly opened issue to ~/.bugbuster/queue/<repo>/ as one JSON file per ticket.
+
+Commands (path defaults to the current directory; must be inside a git clone of
+the GitHub repo to watch):
+  bugbuster wait   [path]   ensure the listener runs, block until a ticket is
+                            queued, print it as JSON on stdout, exit 0
+  bugbuster listen [path]   start the listener only
+  bugbuster stop   [path]   stop the listener and delete the forwarding webhook
+  bugbuster status          list listeners and queue depths
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~/.bugbuster")
+
+
+def die(msg, code=1):
+    print(f"bugbuster: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def repo_slug(path):
+    r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"{path} is not inside a git repository")
+    top = r.stdout.strip()
+    r = subprocess.run(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+        cwd=top, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"cannot resolve the GitHub repo for {top}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def paths_for(slug):
+    safe = slug.replace("/", "__")
+    queue = os.path.join(HOME, "queue", safe)
+    pidfile = os.path.join(HOME, "run", f"{safe}.pid")
+    logfile = os.path.join(HOME, "log", f"{safe}.log")
+    for d in (queue, os.path.dirname(pidfile), os.path.dirname(logfile)):
+        os.makedirs(d, exist_ok=True)
+    return queue, pidfile, logfile
+
+
+def listener_pid(pidfile):
+    try:
+        pid = int(open(pidfile).read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def start_listener(slug):
+    _, pidfile, logfile = paths_for(slug)
+    if listener_pid(pidfile):
+        return False
+    with open(logfile, "ab") as logf:
+        p = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_serve", slug],
+            stdout=logf, stderr=logf, start_new_session=True)
+    with open(pidfile, "w") as f:
+        f.write(str(p.pid))
+    time.sleep(3)  # let gh webhook forward create/activate the hook
+    if p.poll() is not None:
+        os.remove(pidfile)
+        die(f"listener failed to start — see {logfile}")
+    return True
+
+
+def cmd_listen(path):
+    slug = repo_slug(path)
+    state = "started" if start_listener(slug) else "already running"
+    print(f"bugbuster: listener {state} for {slug}", file=sys.stderr)
+
+
+def cmd_wait(path):
+    slug = repo_slug(path)
+    queue, pidfile, logfile = paths_for(slug)
+    start_listener(slug)
+    print(f"bugbuster: watching {slug} for new issues "
+          f"({len(os.listdir(queue))} queued). Blocking until one arrives…",
+          file=sys.stderr)
+    while True:
+        files = sorted(f for f in os.listdir(queue) if f.endswith(".json"))
+        if files:
+            fpath = os.path.join(queue, files[0])
+            data = open(fpath).read()
+            os.remove(fpath)
+            print(data)
+            return
+        if not listener_pid(pidfile):
+            die(f"listener died — see {logfile}")
+        time.sleep(1)  # ponytail: 1s poll on a local dir; fs events if it ever matters
+
+
+def cmd_stop(path):
+    slug = repo_slug(path)
+    _, pidfile, _ = paths_for(slug)
+    pid = listener_pid(pidfile)
+    if pid:
+        os.killpg(pid, signal.SIGTERM)  # _serve leads its own process group; takes gh with it
+        os.remove(pidfile)
+        print(f"bugbuster: listener stopped for {slug}", file=sys.stderr)
+    else:
+        print(f"bugbuster: no listener running for {slug}", file=sys.stderr)
+    r = subprocess.run(["gh", "api", f"repos/{slug}/hooks",
+                        "--jq", '.[] | select(.name=="cli") | .id'],
+                       capture_output=True, text=True)
+    for hook_id in r.stdout.split():
+        subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{slug}/hooks/{hook_id}"],
+                       capture_output=True)
+        print(f"bugbuster: removed forwarding webhook {hook_id}", file=sys.stderr)
+
+
+def cmd_status():
+    rundir = os.path.join(HOME, "run")
+    entries = sorted(os.listdir(rundir)) if os.path.isdir(rundir) else []
+    if not entries:
+        print("no listeners")
+        return
+    for f in entries:
+        safe = f[:-4]
+        pid = listener_pid(os.path.join(rundir, f))
+        queue = os.path.join(HOME, "queue", safe)
+        n = len(os.listdir(queue)) if os.path.isdir(queue) else 0
+        state = f"running (pid {pid})" if pid else "dead"
+        print(f"{safe.replace('__', '/')}: {state}, {n} ticket(s) queued")
+
+
+def cmd_serve(slug):
+    queue, _, _ = paths_for(slug)
+    fails = 0
+    while True:
+        started = time.time()
+        p = subprocess.Popen(
+            ["gh", "webhook", "forward", "--events=issues", f"--repo={slug}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        log(f"gh webhook forward started (pid {p.pid}) for {slug}")
+        for line in p.stdout:
+            line = line.strip()
+            if not line.startswith("{"):
+                if line:
+                    log(f"gh: {line}")
+                continue
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                log(f"unparseable event line: {line[:200]}")
+                continue
+            issue = payload.get("issue")
+            if payload.get("action") != "opened" or not issue:
+                log(f"ignoring issues event action={payload.get('action')}")
+                continue
+            ticket = {
+                "repo": slug,
+                "number": issue["number"],
+                "title": issue["title"],
+                "body": issue.get("body") or "",
+                "html_url": issue["html_url"],
+                "labels": [l["name"] for l in issue.get("labels", [])],
+                "author": issue.get("user", {}).get("login", ""),
+                "created_at": issue.get("created_at", ""),
+            }
+            fname = os.path.join(queue,
+                                 f"{int(time.time() * 1000):013d}-{issue['number']}.json")
+            with open(fname + ".tmp", "w") as f:
+                json.dump(ticket, f, indent=1)
+            os.rename(fname + ".tmp", fname)  # atomic: wait never sees half a ticket
+            log(f"queued issue #{issue['number']}: {issue['title']}")
+        rc = p.wait()
+        # gh exited (network blip, laptop sleep). Restart unless it fails instantly.
+        fails = fails + 1 if time.time() - started < 30 else 0
+        if fails >= 3:
+            log(f"gh webhook forward keeps failing (rc={rc}); giving up")
+            sys.exit(1)
+        log(f"gh webhook forward exited rc={rc}; restarting in 5s")
+        time.sleep(5)
+
+
+def main():
+    args = sys.argv[1:]
+    known = ("wait", "listen", "stop", "status", "_serve")
+    cmd = args[0] if args and args[0] in known else "wait"
+    rest = args[1:] if args and args[0] in known else args
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "_serve":
+        return cmd_serve(rest[0])
+    path = os.path.abspath(rest[0]) if rest else os.getcwd()
+    {"wait": cmd_wait, "listen": cmd_listen, "stop": cmd_stop}[cmd](path)
+
+
+if __name__ == "__main__":
+    main()
