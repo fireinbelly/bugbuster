@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/bugbuster-logo.png" width="160" alt="bugbuster logo">
+</p>
+
 # bugbuster
 
 Open a GitHub issue → your local coding agent fixes it, opens a PR, merges it, and
