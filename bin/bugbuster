@@ -218,13 +218,12 @@ def cmd_stop_owned():
 
 def cmd_status():
     rundir = os.path.join(HOME, "run")
-    entries = sorted(os.listdir(rundir)) if os.path.isdir(rundir) else []
+    entries = sorted(f for f in os.listdir(rundir)
+                     if f.endswith(".pid")) if os.path.isdir(rundir) else []
     if not entries:
         print("no listeners")
         return
     for f in entries:
-        if not f.endswith(".pid"):
-            continue
         safe = f[:-4]
         pidfile = os.path.join(rundir, f)
         pid = listener_pid(pidfile)
