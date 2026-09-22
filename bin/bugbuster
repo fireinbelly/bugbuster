@@ -11,7 +11,13 @@ the GitHub repo to watch):
                             queued, print it as JSON on stdout, exit 0
   bugbuster listen [path]   start the listener only
   bugbuster stop   [path]   stop the listener and delete the forwarding webhook
+  bugbuster stop-owned      stop every listener owned by the claude/codex
+                            process this command descends from (SessionEnd hook)
   bugbuster status          list listeners and queue depths
+
+Ownership: wait/listen record the claude/codex ancestor PID as the listener's
+owner. The listener watches that PID and, when it dies (session exit, terminal
+closed, crash), deletes the forwarding webhook and stops itself.
 """
 import fcntl
 import json
@@ -58,6 +64,53 @@ def paths_for(slug):
     return queue, pidfile, logfile
 
 
+def owner_file(pidfile):
+    return pidfile[:-4] + ".owner"
+
+
+def agent_ancestor():
+    """PID of the claude/codex process this run descends from, if any."""
+    pid = os.getpid()
+    for _ in range(25):
+        r = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(pid)],
+                           capture_output=True, text=True)
+        parts = r.stdout.split(None, 1) if r.returncode == 0 else []
+        if len(parts) < 2:
+            return None
+        ppid, command = int(parts[0]), parts[1]
+        head = os.path.basename(command.split()[0])
+        if head in ("claude", "codex") or (head.startswith("node") and "claude" in command):
+            return pid
+        if ppid <= 1:
+            return None
+        pid = ppid
+    return None
+
+
+def record_owner(pidfile):
+    own = agent_ancestor()
+    if own:
+        with open(owner_file(pidfile), "w") as f:
+            f.write(str(own))
+
+
+def delete_cli_hooks(slug, report):
+    r = subprocess.run(["gh", "api", f"repos/{slug}/hooks",
+                        "--jq", '.[] | select(.name=="cli") | .id'],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        report(f"could not list webhooks on {slug}: {r.stderr.strip()}")
+        return
+    for hook_id in r.stdout.split():
+        d = subprocess.run(["gh", "api", "-X", "DELETE",
+                            f"repos/{slug}/hooks/{hook_id}"],
+                           capture_output=True, text=True)
+        if d.returncode == 0:
+            report(f"removed forwarding webhook {hook_id}")
+        else:
+            report(f"failed to remove webhook {hook_id}: {d.stderr.strip()}")
+
+
 def listener_pid(pidfile):
     try:
         pid = int(open(pidfile).read().strip())
@@ -93,6 +146,7 @@ def start_listener(slug):
 def cmd_listen(path):
     slug = repo_slug(path)
     state = "started" if start_listener(slug) else "already running"
+    record_owner(paths_for(slug)[1])
     print(f"bugbuster: listener {state} for {slug}", file=sys.stderr)
 
 
@@ -100,6 +154,7 @@ def cmd_wait(path):
     slug = repo_slug(path)
     queue, pidfile, logfile = paths_for(slug)
     start_listener(slug)
+    record_owner(pidfile)
     print(f"bugbuster: watching {slug} for new issues "
           f"({len(os.listdir(queue))} queued). Blocking until one arrives…",
           file=sys.stderr)
@@ -116,31 +171,49 @@ def cmd_wait(path):
         time.sleep(1)  # ponytail: 1s poll on a local dir; fs events if it ever matters
 
 
+def stop_one(slug, pidfile, report):
+    pid = listener_pid(pidfile)
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGTERM)  # _serve leads its own group; takes gh with it
+        except OSError:
+            pass
+        report(f"listener stopped for {slug}")
+    else:
+        report(f"no listener running for {slug}")
+    for f in (pidfile, owner_file(pidfile)):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    delete_cli_hooks(slug, report)
+
+
 def cmd_stop(path):
     slug = repo_slug(path)
     _, pidfile, _ = paths_for(slug)
-    pid = listener_pid(pidfile)
-    if pid:
-        os.killpg(pid, signal.SIGTERM)  # _serve leads its own process group; takes gh with it
-        os.remove(pidfile)
-        print(f"bugbuster: listener stopped for {slug}", file=sys.stderr)
-    else:
-        print(f"bugbuster: no listener running for {slug}", file=sys.stderr)
-    r = subprocess.run(["gh", "api", f"repos/{slug}/hooks",
-                        "--jq", '.[] | select(.name=="cli") | .id'],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"bugbuster: could not list webhooks on {slug}: {r.stderr.strip()}",
-              file=sys.stderr)
-    for hook_id in r.stdout.split():
-        d = subprocess.run(["gh", "api", "-X", "DELETE",
-                            f"repos/{slug}/hooks/{hook_id}"],
-                           capture_output=True, text=True)
-        if d.returncode == 0:
-            print(f"bugbuster: removed forwarding webhook {hook_id}", file=sys.stderr)
-        else:
-            print(f"bugbuster: failed to remove webhook {hook_id}: {d.stderr.strip()}",
-                  file=sys.stderr)
+    stop_one(slug, pidfile, lambda m: print(f"bugbuster: {m}", file=sys.stderr))
+
+
+def cmd_stop_owned():
+    """SessionEnd hook / watchdog twin: stop every listener owned by MY agent
+    ancestor. Always exits 0 — a session-end hook must never block shutdown."""
+    me = agent_ancestor()
+    rundir = os.path.join(HOME, "run")
+    if not me or not os.path.isdir(rundir):
+        return
+    for f in sorted(os.listdir(rundir)):
+        if not f.endswith(".pid"):
+            continue
+        pidfile = os.path.join(rundir, f)
+        try:
+            owner = int(open(owner_file(pidfile)).read().strip())
+        except (OSError, ValueError):
+            continue
+        if owner != me:
+            continue
+        slug = f[:-4].replace("__", "/")
+        stop_one(slug, pidfile, lambda m: print(f"bugbuster: {m} (session ended)"))
 
 
 def cmd_status():
@@ -150,16 +223,47 @@ def cmd_status():
         print("no listeners")
         return
     for f in entries:
+        if not f.endswith(".pid"):
+            continue
         safe = f[:-4]
-        pid = listener_pid(os.path.join(rundir, f))
+        pidfile = os.path.join(rundir, f)
+        pid = listener_pid(pidfile)
         queue = os.path.join(HOME, "queue", safe)
         n = len(os.listdir(queue)) if os.path.isdir(queue) else 0
         state = f"running (pid {pid})" if pid else "dead"
+        try:
+            state += f", owner {int(open(owner_file(pidfile)).read().strip())}"
+        except (OSError, ValueError):
+            pass
         print(f"{safe.replace('__', '/')}: {state}, {n} ticket(s) queued")
 
 
+def _owner_watch(slug, pidfile):
+    """Self-destruct when the owning agent process dies (terminal closed,
+    session crashed): delete the forwarding webhook, then stop this listener."""
+    ofile = owner_file(pidfile)
+    while True:
+        time.sleep(5)
+        try:
+            owner = int(open(ofile).read().strip())
+        except (OSError, ValueError):
+            continue  # no owner recorded: plain CLI listener, runs until stopped
+        try:
+            os.kill(owner, 0)
+        except OSError:
+            log(f"owner process {owner} is gone; removing webhook and stopping")
+            delete_cli_hooks(slug, log)
+            for f in (pidfile, ofile):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            os.killpg(os.getpid(), signal.SIGTERM)
+
+
 def cmd_serve(slug):
-    queue, _, _ = paths_for(slug)
+    queue, pidfile, _ = paths_for(slug)
+    threading.Thread(target=_owner_watch, args=(slug, pidfile), daemon=True).start()
     fails = 0
     ok_once = False  # has gh ever run long enough to be considered healthy?
     while True:
@@ -220,11 +324,13 @@ def cmd_serve(slug):
 
 def main():
     args = sys.argv[1:]
-    known = ("wait", "listen", "stop", "status", "_serve")
+    known = ("wait", "listen", "stop", "stop-owned", "status", "_serve")
     cmd = args[0] if args and args[0] in known else "wait"
     rest = args[1:] if args and args[0] in known else args
     if cmd == "status":
         return cmd_status()
+    if cmd == "stop-owned":
+        return cmd_stop_owned()
     if cmd == "_serve":
         return cmd_serve(rest[0])
     path = os.path.abspath(rest[0]) if rest else os.getcwd()

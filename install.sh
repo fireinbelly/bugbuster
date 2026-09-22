@@ -26,6 +26,24 @@ mkdir -p "$HOME/.claude/skills/bugbuster"
 fetch skills/claude/SKILL.md > "$HOME/.claude/skills/bugbuster/SKILL.md"
 INSTALLED="Claude Code (/bugbuster)"
 
+# SessionEnd hook so /clear and /exit stop the listener + webhook of that session
+python3 - <<'PY'
+import json, os
+p = os.path.expanduser("~/.claude/settings.json")
+try:
+    s = json.load(open(p))
+except (OSError, ValueError):
+    s = {}
+cmd = "$HOME/.bugbuster/bin/bugbuster stop-owned"
+entries = s.setdefault("hooks", {}).setdefault("SessionEnd", [])
+if not any(cmd in json.dumps(e) for e in entries):
+    entries.append({"hooks": [{"type": "command", "command": cmd}]})
+    with open(p, "w") as f:
+        json.dump(s, f, indent=2)
+        f.write("\n")
+    print("registered Claude Code SessionEnd hook (auto-stop on /clear, /exit)")
+PY
+
 # Codex prompt -> /bugbuster, only when Codex is present
 if command -v codex >/dev/null 2>&1 || [ -d "$HOME/.codex" ]; then
   mkdir -p "$HOME/.codex/prompts"

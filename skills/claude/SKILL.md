@@ -12,11 +12,18 @@ plumbing; your job is the engineering.
 ## Setup (once)
 
 1. REPO = the argument given after `/bugbuster`, else the current working directory.
-   Resolve to an absolute path.
-2. Sanity check: `git -C REPO rev-parse --show-toplevel` succeeds, and
-   `~/.bugbuster/bin/bugbuster listen REPO` starts (it prints the `owner/repo` slug
-   it is watching). If either fails, show the error and stop.
-3. Tell the user in one line which repo slug is being watched, then enter the loop.
+   Resolve to an absolute path. Sanity check: `git -C REPO rev-parse --show-toplevel`
+   succeeds. If not, show the error and stop.
+2. **Ask the user for the per-ticket handler** (plain text question, then end your
+   turn and wait for their reply — do not start the loop before they answer):
+   "Each new issue will be handled with the default pipeline (fix → PR → merge →
+   close the ticket). Reply **default** to use it, or type a custom instruction or
+   slash command to run for every ticket instead — it will be followed exactly.
+   (Tip: a slash command works with or without the leading `/`, e.g. `gsc-report`.)"
+   Store the reply as HANDLER. Empty / "default" → default pipeline.
+3. Start watching: `~/.bugbuster/bin/bugbuster listen REPO` (it prints the
+   `owner/repo` slug). If it fails, show the error and stop. Tell the user in one
+   line which repo is watched and which handler is active, then enter the loop.
 
 ## Loop (repeat until the user says stop)
 
@@ -29,6 +36,15 @@ plumbing; your job is the engineering.
 2. **Guard.** `gh issue view N --json state` (run inside REPO). Already closed →
    skip straight back to step 1. (Covers webhook redeliveries and manually
    handled tickets.)
+
+**If HANDLER is custom, it is authoritative and REPLACES steps 3-7 entirely:**
+execute the user's instruction exactly as given, 100% — no default pipeline steps
+(no claiming, no PR, no merge, no closing) unless the handler itself asks for them.
+If HANDLER is (or names) a slash command, invoke that skill/command, passing the
+ticket as its argument/context. If HANDLER contains a literal `{ticket}`
+placeholder, substitute the ticket JSON; otherwise provide the ticket JSON
+(number, title, body, url) as context alongside. When done, report one line and
+go back to step 1. The steps below apply only to the default pipeline.
 3. **Claim it.** `gh issue comment N --body "🤖 bugbuster is on it."`
 4. **Fix it.** `git fetch origin`, then create `bugbuster/issue-N` from
    `origin/<default-branch>` — never from local state (the clone may hold
@@ -52,3 +68,7 @@ plumbing; your job is the engineering.
 When the user says stop: kill the background wait task, then run
 `~/.bugbuster/bin/bugbuster stop "REPO"` (stops the listener and deletes the
 forwarding webhook from the repo).
+
+You do not need to handle `/clear`, `/exit`, or the terminal closing — a
+SessionEnd hook runs `bugbuster stop-owned`, and the listener's own watchdog
+stops it and deletes the webhook if this session's process dies.
