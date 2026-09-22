@@ -97,6 +97,11 @@ A listener started manually from a plain shell has no agent owner and runs until
 - The listener survives network blips (auto-restart), but after a long laptop sleep
   restart it with `bugbuster stop && bugbuster listen` if the log shows no traffic.
 - Runtime state lives in `~/.bugbuster/{queue,run,log}/`.
+- On `/exit`, Claude Code asks to confirm stopping the background wait task —
+  confirm it; the webhook cleanup hook runs right after.
+- The listener clears any leftover `cli` forwarding hook on the repo at startup
+  (recovery after a crash/reboot). Don't run bugbuster listeners for the same
+  repo from two machines at once — the second start would clear the first's hook.
 
 ## Uninstall
 

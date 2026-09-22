@@ -263,6 +263,10 @@ def _owner_watch(slug, pidfile):
 def cmd_serve(slug):
     queue, pidfile, _ = paths_for(slug)
     threading.Thread(target=_owner_watch, args=(slug, pidfile), daemon=True).start()
+    # A leftover hook from an uncleanly-killed listener makes gh webhook forward
+    # die with HTTP 422 "Hook already exists" (seen live 2026-09-21). Start clean;
+    # gh then creates a fresh hook it can reuse across its own restarts.
+    delete_cli_hooks(slug, lambda m: log(f"startup cleanup: {m}"))
     fails = 0
     ok_once = False  # has gh ever run long enough to be considered healthy?
     while True:
